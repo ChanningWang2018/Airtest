@@ -67,3 +67,6 @@ Pipfile.lock
 
 *.sublime-project
 *.sublime-workspace
+
+.gemini/
+.venv/

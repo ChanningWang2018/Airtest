@@ -28,6 +28,7 @@ def retry_when_socket_error(func):
         except socket.error:
             inst.frame_gen = None
             return func(inst, *args, **kwargs)
+
     return wrapper
 
 
@@ -38,10 +39,19 @@ class Minicap(BaseCap):
     """
 
     VERSION = 5
-    RECVTIMEOUT = 3  # default value is None, but the version above 1.2.7 is changed to 3s
+    RECVTIMEOUT = (
+        3  # default value is None, but the version above 1.2.7 is changed to 3s
+    )
     CMD = "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/minicap"
 
-    def __init__(self, adb, projection=None, rotation_watcher=None, display_id=None, ori_function=None):
+    def __init__(
+        self,
+        adb,
+        projection=None,
+        rotation_watcher=None,
+        display_id=None,
+        ori_function=None,
+    ):
         """
         :param adb: adb instance of android device
         :param projection: projection, default is None. If `None`, physical display size is used
@@ -72,8 +82,9 @@ class Minicap(BaseCap):
             None
 
         """
-        if self.adb.exists_file("/data/local/tmp/minicap") \
-                and self.adb.exists_file("/data/local/tmp/minicap.so"):
+        if self.adb.exists_file("/data/local/tmp/minicap") and self.adb.exists_file(
+            "/data/local/tmp/minicap.so"
+        ):
             try:
                 output = self.adb.raw_shell("%s -v 2>&1" % self.CMD)
             except Exception as err:
@@ -87,13 +98,16 @@ class Minicap(BaseCap):
                 else:
                     version = -1
             if version >= self.VERSION:
-                LOGGING.debug('skip install minicap')
+                LOGGING.debug("skip install minicap")
                 return
             else:
-                LOGGING.debug('upgrade minicap to lastest version: %s->%s' % (version, self.VERSION))
+                LOGGING.debug(
+                    "upgrade minicap to lastest version: %s->%s"
+                    % (version, self.VERSION)
+                )
                 self.uninstall()
         else:
-            LOGGING.debug('install minicap')
+            LOGGING.debug("install minicap")
         self.install()
 
     def uninstall(self):
@@ -137,9 +151,12 @@ class Minicap(BaseCap):
 
         path = os.path.join(STFLIB, abi, binfile)
         self.adb.push(path, "%s/minicap" % device_dir)
+        print(path)
         self.adb.shell("chmod 755 %s/minicap" % device_dir)
 
-        pattern = os.path.join(STFLIB, 'minicap-shared/aosp/libs/android-%s/%s/minicap.so')
+        pattern = os.path.join(
+            STFLIB, "minicap-shared/aosp/libs/android-%s/%s/minicap.so"
+        )
         path = pattern % (sdk, abi)
         if not os.path.isfile(path):
             path = pattern % (rel, abi)
@@ -148,7 +165,7 @@ class Minicap(BaseCap):
         self.adb.shell("chmod 755 %s/minicap.so" % device_dir)
         LOGGING.info("minicap installation finished")
 
-    @on_method_ready('install_or_upgrade')
+    @on_method_ready("install_or_upgrade")
     def get_frame(self, projection=None):
         """
         Get the single frame from minicap -s, this method slower than `get_frames`
@@ -166,7 +183,10 @@ class Minicap(BaseCap):
         params, display_info = self._get_params(projection)
         if self.display_id:
             raw_data = self.adb.raw_shell(
-                self.CMD + " -d " + str(self.display_id) + " -n 'airtest_minicap' -P %dx%d@%dx%d/%d -s" % params,
+                self.CMD
+                + " -d "
+                + str(self.display_id)
+                + " -n 'airtest_minicap' -P %dx%d@%dx%d/%d -s" % params,
                 ensure_unicode=False,
             )
         else:
@@ -207,7 +227,7 @@ class Minicap(BaseCap):
 
         return (params, display_info)
 
-    @on_method_ready('install_or_upgrade')
+    @on_method_ready("install_or_upgrade")
     def get_stream(self, lazy=True):
         """
         Get stream, it uses `adb forward`and socket communication. Use minicap ``lazy``mode (provided by gzmaruijie)
@@ -236,7 +256,7 @@ class Minicap(BaseCap):
         return gen
 
     @threadsafe_generator
-    @on_method_ready('install_or_upgrade')
+    @on_method_ready("install_or_upgrade")
     def _get_stream(self, lazy=True):
         self._cleanup_minicap()
         proc, nbsp, localport = self._setup_stream_server(lazy=lazy)
@@ -300,21 +320,27 @@ class Minicap(BaseCap):
             adb shell process, non-blocking stream reader and local port
 
         """
-        localport, deviceport = self.adb.setup_forward("localabstract:minicap_{}".format)
-        deviceport = deviceport[len("localabstract:"):]
+        localport, deviceport = self.adb.setup_forward(
+            "localabstract:minicap_{}".format
+        )
+        deviceport = deviceport[len("localabstract:") :]
         other_opt = "-l" if lazy else ""
         params, display_info = self._get_params()
         if self.display_id:
             proc = self.adb.start_shell(
-                "%s -d %s -n '%s' -P %dx%d@%dx%d/%d %s 2>&1" %
-                tuple([self.CMD, self.display_id, deviceport] + list(params) + [other_opt]),
+                "%s -d %s -n '%s' -P %dx%d@%dx%d/%d %s 2>&1"
+                % tuple(
+                    [self.CMD, self.display_id, deviceport] + list(params) + [other_opt]
+                ),
             )
         else:
             proc = self.adb.start_shell(
-                "%s -n '%s' -P %dx%d@%dx%d/%d %s 2>&1" %
-                tuple([self.CMD, deviceport] + list(params) + [other_opt]),
+                "%s -n '%s' -P %dx%d@%dx%d/%d %s 2>&1"
+                % tuple([self.CMD, deviceport] + list(params) + [other_opt]),
             )
-        nbsp = NonBlockingStreamReader(proc.stdout, print_output=True, name="minicap_server", auto_kill=True)
+        nbsp = NonBlockingStreamReader(
+            proc.stdout, print_output=True, name="minicap_server", auto_kill=True
+        )
         while True:
             line = nbsp.readline(timeout=5.0)
             if line is None:
