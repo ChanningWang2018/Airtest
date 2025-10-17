@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 from collections import OrderedDict
-from airtest.core.error import AdbError, ScreenError
-from airtest.core.android.cap_methods.base_cap import BaseCap
-from airtest.utils.logger import get_logger
 
+from airtest.core.android.cap_methods.base_cap import BaseCap
+from airtest.core.error import AdbError, ScreenError
+from airtest.utils.logger import get_logger
 
 LOGGING = get_logger(__name__)
 
@@ -12,6 +12,7 @@ class ScreenProxy(object):
     """
     Perform screen operation according to the specified method
     """
+
     SCREEN_METHODS = OrderedDict()
 
     def __init__(self, screen_method):
@@ -23,8 +24,10 @@ class ScreenProxy(object):
         elif name == "method_name":
             return self.screen_method.__class__.__name__.upper()
         else:
-            raise NotImplementedError("%s does not support \'%s\' method" %
-                                      (getattr(self.screen_method, "METHOD_NAME", ""), name))
+            raise NotImplementedError(
+                "%s does not support '%s' method"
+                % (getattr(self.screen_method, "METHOD_NAME", ""), name)
+            )
 
     def __setattr__(self, name, value):
         if name == "screen_method":
@@ -87,8 +90,13 @@ class ScreenProxy(object):
         """
         screen = None
         if default_method:
-            if isinstance(default_method, str) and default_method.upper() in cls.SCREEN_METHODS:
-                screen = cls.SCREEN_METHODS[default_method.upper()](adb, *args, **kwargs)
+            if (
+                isinstance(default_method, str)
+                and default_method.upper() in cls.SCREEN_METHODS
+            ):
+                screen = cls.SCREEN_METHODS[default_method.upper()](
+                    adb, *args, **kwargs
+                )
             elif isinstance(default_method, BaseCap):
                 screen = default_method
             if screen and cls.check_frame(screen):
@@ -106,11 +114,14 @@ class ScreenProxy(object):
 
 def register_screen():
     # 按优先级逆序注册默认的屏幕截图方法
-    from airtest.core.android.cap_methods.minicap import Minicap
-    from airtest.core.android.cap_methods.javacap import Javacap
     from airtest.core.android.cap_methods.adbcap import AdbCap
+    from airtest.core.android.cap_methods.javacap import Javacap
+    from airtest.core.android.cap_methods.minicap import Minicap
+    from airtest.core.android.cap_methods.minicap_apk import MinicapApk
+
     ScreenProxy.SCREEN_METHODS["ADBCAP"] = AdbCap
     ScreenProxy.SCREEN_METHODS["JAVACAP"] = Javacap
+    ScreenProxy.SCREEN_METHODS["MINICAP_APK"] = MinicapApk
     ScreenProxy.SCREEN_METHODS["MINICAP"] = Minicap
 
 
