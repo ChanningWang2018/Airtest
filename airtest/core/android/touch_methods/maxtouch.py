@@ -29,11 +29,13 @@ class Maxtouch(BaseTouch):
         """
         try:
             exists_file = self.adb.file_size(self.path_in_android)
-        except:
-            pass
-        else:
+        except Exception as e:
+            LOGGING.debug("check maxtouch file size failed: %s" % e)
+            exists_file = None
+        
+        if exists_file:
             local_minitouch_size = int(os.path.getsize(MAXTOUCH_JAR))
-            if exists_file and exists_file == local_minitouch_size:
+            if exists_file == local_minitouch_size:
                 LOGGING.debug("install_maxtouch skipped")
                 return
             self.uninstall()
@@ -66,19 +68,21 @@ class Maxtouch(BaseTouch):
 
         self.localport, deviceport = self.adb.setup_forward("localabstract:maxpresent_{}".format)
         deviceport = deviceport[len("localabstract:"):]
-        p = self.adb.start_shell("app_process -Djava.class.path={0} /data/local/tmp com.netease.maxpresent.MaxPresent socket {1}".format(self.path_in_android, deviceport))
+        p = self.adb.start_shell("app_process -Djava.class.path={0} /data/local/tmp com.netease.maxpresent.MaxPresent socket {1} 2>&1".format(self.path_in_android, deviceport))
 
-        nbsp = NonBlockingStreamReader(p.stdout, name="airtouch_server", auto_kill=True)
-        line = nbsp.readline(timeout=5.0)
+        nbsp = NonBlockingStreamReader(p.stdout, name="maxtouch_server", auto_kill=True)
+        line = nbsp.readline(timeout=10.0)  # 增加超时时间到10秒
         if line is None:
             kill_proc(p)
-            raise RuntimeError("airtouch setup timeout")
+            raise RuntimeError("maxtouch setup timeout")
 
+        # 检查进程是否已退出
         if p.poll() is not None:
             # server setup error, may be already setup by others
             # subprocess exit immediately
             kill_proc(p)
-            raise RuntimeError("airtouch server quit immediately")
+            raise RuntimeError("maxtouch server quit immediately")
+        
         self.server_proc = p
         return p
 
