@@ -21,14 +21,18 @@ from airtest.utils.threadsafe import threadsafe_generator
 LOGGING = get_logger(__name__)
 
 
-def retry_when_socket_error(func):
+def retry_when_socket_error(func, max_retries=3):
     @wraps(func)
     def wrapper(inst, *args, **kwargs):
-        try:
-            return func(inst, *args, **kwargs)
-        except socket.error:
-            inst.frame_gen = None
-            return func(inst, *args, **kwargs)
+        for attempt in range(max_retries):
+            try:
+                return func(inst, *args, **kwargs)
+            except socket.error:
+                LOGGING.warning("socket error on attempt %d/%d, retrying..." % (attempt + 1, max_retries))
+                inst.frame_gen = None
+                if attempt < max_retries - 1:
+                    time.sleep(0.5 * (2 ** attempt))
+        return func(inst, *args, **kwargs)
 
     return wrapper
 
@@ -240,37 +244,38 @@ class MinicapApk(BaseCap):
         self.cleanup_func.append(partial(self.adb.remove_forward, "tcp:%s" % localport))
         yield stopping
 
-        while not stopping:
-            # recv frame header, count frame_size
-            # if self.RECVTIMEOUT is not None:
-            #     # Some mobile phones may keep waiting for data when switching between horizontal and vertical screens,
-            #     # and the connection is not closed, resulting in a black screen
-            #     # Set the timeout to 3s(airtest>=1.2.7)
-            #     header = s.recv_with_timeout(4, self.RECVTIMEOUT)
-            # else:
-            #     header = s.recv(4)
-            # if header is None:
-            #     LOGGING.error("minicap header is None")
-            #     # recv timeout, if not frame updated, maybe screen locked
-            #     stopping = yield None
-            # else:
-            #     frame_size = struct.unpack("<I", header)[0]
-            #     if self.RECVTIMEOUT is not None:
-            #         frame_data = s.recv_with_timeout(frame_size, self.RECVTIMEOUT)
-            #     else:
-            #         frame_data = s.recv(frame_size)
-            #     stopping = yield frame_data
-            frame_data = s.recv_latest_frame()
-            if frame_data is None:  # 当前无帧
-                time.sleep(0.001)  # 让点 CPU
-                continue
-
-            stopping = yield frame_data
-
-        LOGGING.debug("minicap stream ends")
-        # teardown stream() cannot be called directly because the connection may be rebuilt multiple times
-        # while the screen is rotated, and self.frame_gen gets stuck
-        self._cleanup()
+        try:
+            while not stopping:
+                if lazy:
+                    s.send(b"1")
+                # recv frame header, count frame_size
+                if self.RECVTIMEOUT is not None:
+                    # Some mobile phones may keep waiting for data when switching between horizontal and vertical screens,
+                    # and the connection is not closed, resulting in a black screen
+                    # Set the timeout to 3s(airtest>=1.2.7)
+                    header = s.recv_with_timeout(4, self.RECVTIMEOUT)
+                else:
+                    header = s.recv(4)
+                if header is None:
+                    LOGGING.error("minicap header is None")
+                    # recv timeout, check if due to rotation
+                    if self._update_rotation_event.is_set():
+                        LOGGING.debug("timeout due to rotation, teardown stream")
+                        self._update_rotation_event.clear()
+                        # Signal generator to stop and trigger reconnection
+                        return
+                    # recv timeout, if not frame updated, maybe screen locked
+                    stopping = yield None
+                else:
+                    frame_size = struct.unpack("<I", header)[0]
+                    if self.RECVTIMEOUT is not None:
+                        frame_data = s.recv_with_timeout(frame_size, self.RECVTIMEOUT)
+                    else:
+                        frame_data = s.recv(frame_size)
+                    stopping = yield frame_data
+        finally:
+            LOGGING.debug("minicap stream ends")
+            self._cleanup()
 
     def _setup_stream_server(self, lazy=True):
         """
@@ -383,28 +388,29 @@ class MinicapApk(BaseCap):
         Returns:
 
         """
-        # 卡住的进程状态
         TASK_INTERRUPTIBLE1 = "__skb_wait_for_more_packets"
         TASK_INTERRUPTIBLE2 = "futex_wait_queue_me"
 
         shell_output = ""
         try:
             shell_output = self.adb.shell("ps -A| grep io.devicefarmer.minicap")
-        except:
+        except Exception as e:
+            LOGGING.debug("ps -A failed: %s, trying ps without -A", e)
             try:
                 shell_output = self.adb.shell("ps| grep io.devicefarmer.minicap")
-            except:
+            except Exception as e:
+                LOGGING.debug("ps also failed: %s", e)
                 pass
 
-        if len(shell_output) == 0:
+        if not shell_output or len(shell_output) == 0:
             return
         for line in shell_output.split("\r\n"):
             if TASK_INTERRUPTIBLE1 in line or TASK_INTERRUPTIBLE2 in line:
-                pid = line.split()[1]
                 try:
+                    pid = line.split()[1]
                     self.adb.shell("kill %s" % pid)
-                except:
-                    pass
+                except Exception as e:
+                    LOGGING.debug("Failed to kill pid: %s", e)
 
     def _cleanup(self):
         """
@@ -417,7 +423,10 @@ class MinicapApk(BaseCap):
 
         """
         for func in self.cleanup_func:
-            func()
+            try:
+                func()
+            except Exception as e:
+                LOGGING.debug("Cleanup func failed: %s", e)
         self.cleanup_func = []
 
     def teardown_stream(self):

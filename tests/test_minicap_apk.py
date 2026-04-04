@@ -52,6 +52,34 @@ class TestMinicapApk(TestMinicapApkBase):
         frame = string_2_img(frame)
         self.assertIsInstance(frame, ndarray)
 
+    def test_screenshot_validity(self):
+        """
+        Verify that both get_frame_from_stream and get_frame produce valid JPEG data
+        with correct image dimensions matching device display info.
+        """
+        expected_height = self.dev.display_info.get("height")
+        expected_width = self.dev.display_info.get("width")
+
+        # Test stream capture
+        frame_stream = self.minicap_apk.get_frame_from_stream()
+        self.assertIsInstance(frame_stream, bytes)
+        self.assertTrue(frame_stream.startswith(b"\xff\xd8"), "Stream frame is not valid JPEG")
+        self.assertTrue(frame_stream.endswith(b"\xff\xd9"), "Stream frame JPEG trailer missing")
+        img_stream = string_2_img(frame_stream)
+        self.assertIsInstance(img_stream, ndarray)
+        self.assertEqual(img_stream.shape[0], expected_height)
+        self.assertEqual(img_stream.shape[1], expected_width)
+
+        # Test single frame capture
+        frame_single = self.minicap_apk.get_frame()
+        self.assertIsInstance(frame_single, bytes)
+        self.assertTrue(frame_single.startswith(b"\xff\xd8"), "Single frame is not valid JPEG")
+        self.assertTrue(frame_single.endswith(b"\xff\xd9"), "Single frame JPEG trailer missing")
+        img_single = string_2_img(frame_single)
+        self.assertIsInstance(img_single, ndarray)
+        self.assertEqual(img_single.shape[0], expected_height)
+        self.assertEqual(img_single.shape[1], expected_width)
+
     def test_rotation(self):
         self.dev.keyevent("HOME")
         time.sleep(1)
