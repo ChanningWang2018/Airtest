@@ -182,13 +182,13 @@ class BaseTouch(object):
         return x, y
 
     @on_method_ready('install_and_setup')
-    def perform(self, motion_events, interval=0.01):
+    def perform(self, motion_events, interval=0):
         """
         Perform a sequence of motion events including: UpEvent, DownEvent, MoveEvent, SleepEvent
 
         Args:
             motion_events: a list of MotionEvent instances
-            interval: minimum interval between events
+            interval: minimum interval between events, default is 0
 
         Returns:
             None
