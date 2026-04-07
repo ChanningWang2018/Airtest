@@ -44,7 +44,8 @@ class Android(Device):
                  display_id=None,
                  input_event=None,
                  adb_path=None,
-                 name=None):
+                 name=None,
+                 force_minitouch=False):
         super(Android, self).__init__()
         self.serialno = serialno or self.get_default_device(adb_path=adb_path)
         self._uuid = name or self.serialno
@@ -58,7 +59,7 @@ class Android(Device):
         self.adb = ADB(self.serialno, adb_path=adb_path, server_addr=host, display_id=self.display_id, input_event=self.input_event)
         self.adb.wait_for_device()
         self.sdk_version = self.adb.sdk_version
-        if self.sdk_version >= SDK_VERISON_ANDROID10 and self._touch_method == TOUCH_METHOD.MINITOUCH:
+        if not force_minitouch and self.sdk_version >= SDK_VERISON_ANDROID10 and self._touch_method == TOUCH_METHOD.MINITOUCH:
             self._touch_method = TOUCH_METHOD.MAXTOUCH
         self._display_info = {}
         self._current_orientation = None
