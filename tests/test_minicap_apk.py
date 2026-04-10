@@ -116,6 +116,36 @@ class TestMinicapApk(TestMinicapApkBase):
         self.assertEqual(screen2.shape[0], default_height)
 
 
+class TestLazyMode(TestMinicapApkBase):
+    def test_lazy_interval(self):
+        import os
+        from PIL import Image
+        import io
+        
+        output_dir = os.path.join(os.path.dirname(__file__), "lazy_captures")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        intervals = []
+        for i in range(5):
+            start = time.time()
+            frame = self.minicap_apk.get_frame_from_stream()
+            elapsed = time.time() - start
+            intervals.append(elapsed)
+            
+            img = string_2_img(frame)
+            pil_img = Image.fromarray(img)
+            filepath = os.path.join(output_dir, "lazy_%d.jpg" % i)
+            pil_img.save(filepath, "JPEG")
+            print("Captured %s, interval: %.2fs" % (filepath, elapsed))
+            
+            if i < 4:
+                time.sleep(2)
+        
+        avg_interval = sum(intervals) / len(intervals)
+        print("Average interval: %.2fs" % avg_interval)
+        self.assertLess(avg_interval, 2.5, "Average interval too high")
+
+
 class TestMinicapApkSetup(TestMinicapApkBase):
     def test_0_install(self):
         self.minicap_apk.uninstall()

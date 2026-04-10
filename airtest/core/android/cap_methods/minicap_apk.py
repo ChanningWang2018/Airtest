@@ -292,7 +292,7 @@ class MinicapApk(BaseCap):
             "localabstract:minicap_apk_{}".format
         )
         deviceport = deviceport[len("localabstract:") :]
-        other_opt = "-r 10" if lazy else ""  # control the frame rate
+        other_opt = "-l" if lazy else "-r 30"  # lazy mode or frame rate
         params, display_info = self._get_params()
         if self.display_id:
             proc = self.adb.start_shell(

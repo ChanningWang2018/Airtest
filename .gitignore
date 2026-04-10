@@ -70,3 +70,4 @@ Pipfile.lock
 
 .gemini/
 .venv/
+tests/lazy_captures/
