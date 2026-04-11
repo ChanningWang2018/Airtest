@@ -244,27 +244,28 @@ class MinicapApk(BaseCap):
         self.cleanup_func.append(partial(self.adb.remove_forward, "tcp:%s" % localport))
         yield stopping
 
+        # In lazy mode, need to send initial request to start the request-response cycle
+        if lazy:
+            LOGGING.debug("lazy mode: sending initial request")
+            s.sock.send(b"1")
+            time.sleep(0.3)  # Wait for server to process
+
         try:
             while not stopping:
                 if lazy:
-                    s.send(b"1")
+                    s.sock.send(b"1")
+                    LOGGING.debug("lazy mode: sent request, waiting for response")
                 # recv frame header, count frame_size
                 if self.RECVTIMEOUT is not None:
-                    # Some mobile phones may keep waiting for data when switching between horizontal and vertical screens,
-                    # and the connection is not closed, resulting in a black screen
-                    # Set the timeout to 3s(airtest>=1.2.7)
                     header = s.recv_with_timeout(4, self.RECVTIMEOUT)
                 else:
                     header = s.recv(4)
                 if header is None:
                     LOGGING.error("minicap header is None")
-                    # recv timeout, check if due to rotation
                     if self._update_rotation_event.is_set():
                         LOGGING.debug("timeout due to rotation, teardown stream")
                         self._update_rotation_event.clear()
-                        # Signal generator to stop and trigger reconnection
                         return
-                    # recv timeout, if not frame updated, maybe screen locked
                     stopping = yield None
                 else:
                     frame_size = struct.unpack("<I", header)[0]
@@ -272,6 +273,7 @@ class MinicapApk(BaseCap):
                         frame_data = s.recv_with_timeout(frame_size, self.RECVTIMEOUT)
                     else:
                         frame_data = s.recv(frame_size)
+                    LOGGING.debug("lazy mode: received frame, size=%d" % len(frame_data) if frame_data else "None")
                     stopping = yield frame_data
         finally:
             LOGGING.debug("minicap stream ends")
@@ -341,7 +343,26 @@ class MinicapApk(BaseCap):
             self._update_rotation_event.clear()
         if self.frame_gen is None:
             self.frame_gen = self.get_stream(True)
-        return six.next(self.frame_gen)
+            self._last_request_time = time.time()
+        
+        # In lazy mode, ensure minimum interval between requests
+        # This allows the server to capture a new frame
+        current_time = time.time()
+        elapsed = current_time - getattr(self, '_last_request_time', current_time)
+        if elapsed < 1.5:
+            wait_time = 1.5 - elapsed
+            LOGGING.debug("lazy mode: waiting %.2fs before next request" % wait_time)
+            time.sleep(wait_time)
+        
+        frame = six.next(self.frame_gen)
+        
+        if frame is None:
+            LOGGING.debug("received None frame, reconnecting")
+            self.frame_gen = None
+            return self.get_frame_from_stream()
+        
+        self._last_request_time = time.time()
+        return frame
 
     def snapshot(self, ensure_orientation=True, projection=None):
         """

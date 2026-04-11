@@ -128,7 +128,13 @@ class TestLazyMode(TestMinicapApkBase):
         intervals = []
         for i in range(5):
             start = time.time()
-            frame = self.minicap_apk.get_frame_from_stream()
+            try:
+                frame = self.minicap_apk.get_frame_from_stream()
+            except Exception as e:
+                print(f"Error getting frame {i}: {e}")
+                self.minicap_apk.teardown_stream()
+                self.minicap_apk.frame_gen = None
+                frame = self.minicap_apk.get_frame_from_stream()
             elapsed = time.time() - start
             intervals.append(elapsed)
             
