@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import select
 import socket
 import struct
 import threading
@@ -45,7 +46,7 @@ class MinicapApk(BaseCap):
 
     VERSION = 5
     RECVTIMEOUT = (
-        3  # default value is None, but the version above 1.2.7 is changed to 3s
+        5  # 5s timeout
     )
     CMD = "CLASSPATH=/data/local/tmp/minicap-debug.apk app_process /system/bin io.devicefarmer.minicap.Main"
     APK_PATH = "/data/local/tmp/minicap-debug.apk"
@@ -131,38 +132,113 @@ class MinicapApk(BaseCap):
     @on_method_ready("install_or_upgrade")
     def get_frame(self, projection=None):
         """
-        Get the single frame from minicap-debug.apk -s, this method slower than `get_frames`
-            1. shell cmd
-            1. remove log info
-            1. \r\r\n -> \n ...
-
-        Args:
-            projection: screenshot projection, default is None which means using self.projection
-
-        Returns:
-            jpg data
-
+        Get a single frame using direct socket connection.
+        Simplified approach similar to reference test_lazy_mode.py:
+        1. Setup server
+        2. Connect socket
+        3. Send request
+        4. Receive frame
+        5. Cleanup
         """
-        params, display_info = self._get_params(projection)
-        if self.display_id:
-            raw_data = self.adb.raw_shell(
-                self.CMD
-                + " -d "
-                + str(self.display_id)
-                + " -n 'airtest_minicap_apk' -P %dx%d@%dx%d/%d -s" % params,
-                ensure_unicode=False,
-            )
-        else:
-            raw_data = self.adb.raw_shell(
-                self.CMD + " -n 'airtest_minicap_apk' -P %dx%d@%dx%d/%d -s" % params,
-                ensure_unicode=False,
-            )
-        jpg_data = raw_data.split(b"for JPG encoder" + self.adb.line_breaker)[-1]
-        jpg_data = jpg_data.replace(self.adb.line_breaker, b"\n")
-        if jpg_data.startswith(b"\xff\xd8") and jpg_data.endswith(b"\xff\xd9"):
-            return jpg_data
-        else:
-            raise ScreenError("invalid jpg format")
+        if self._update_rotation_event.is_set():
+            LOGGING.debug("get_frame: rotation update, teardown")
+            self.teardown_stream()
+            self._update_rotation_event.clear()
+        
+        try:
+            self._cleanup_minicap()
+            proc, nbsp, localport = self._setup_stream_server(lazy=True)
+            
+            # Use plain socket instead of SafeSocket to avoid buffering issues
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(30)
+            s.connect((self.adb.host, localport))
+            LOGGING.debug("get_frame: connected to localhost:%d", localport)
+            
+            banner = s.recv(24)
+            LOGGING.debug("get_frame: received banner: %d bytes, first 10 bytes: %s", len(banner), banner[:10])
+            if len(banner) != 24:
+                raise ScreenError("Failed to receive banner: got %d bytes" % len(banner))
+            LOGGING.debug("get_frame: received banner, 24 bytes")
+            
+            # Parse banner and determine request pattern
+            try:
+                banner_data = struct.unpack("<2B5I2B", banner)
+                LOGGING.debug("get_frame: banner parsed - version=%d, screen=%dx%d, target=%dx%d, ori=%d, quirk=%d",
+                              banner_data[0], banner_data[3], banner_data[4], 
+                              banner_data[5], banner_data[6], banner_data[7], banner_data[8])
+                ori = banner_data[7]
+            except Exception as e:
+                LOGGING.debug("get_frame: failed to parse banner: %s", e)
+                ori = 1  # Default to non-zero rotation
+            
+            # Optimized request pattern based on rotation
+            use_hybrid = (ori != 0)
+            if use_hybrid:
+                # For rotation=90, need hybrid approach
+                LOGGING.debug("get_frame: sending b'1' to wake up server")
+                s.send(b"1")
+                time.sleep(0.5)
+                LOGGING.debug("get_frame: sending b'\\x00' to request frame")
+                s.send(b'\x00')
+                time.sleep(0.5)
+            else:
+                # For rotation=0, only b"1" is needed
+                LOGGING.debug("get_frame: sending b'1' to request frame")
+                s.send(b"1")
+                time.sleep(0.5)
+            
+            # Try reading - if fails, try sending again (like stream version does in loop)
+            LOGGING.debug("get_frame: attempting to receive frame header...")
+            
+            # Check if socket is still usable
+            if s._closed:
+                raise ScreenError("Socket was closed unexpectedly")
+            
+            # Set timeout for receive
+            s.settimeout(15)
+            LOGGING.debug("get_frame: waiting for frame header...")
+            
+            # Receive frame header (4 bytes)
+            s.settimeout(15)
+            header = s.recv(4)
+            LOGGING.debug("get_frame: received header: %d bytes", len(header))
+            if len(header) != 4:
+                raise ScreenError("Failed to receive frame header: got %d bytes" % len(header))
+            
+            frame_size = struct.unpack("<I", header)[0]
+            LOGGING.debug("get_frame: frame header received, size=%d", frame_size)
+            if frame_size == 0:
+                raise ScreenError("Invalid frame size: 0")
+            
+            # Receive frame data with chunked reading for large frames
+            LOGGING.debug("get_frame: receiving frame data (%d bytes)...", frame_size)
+            frame_data = b""
+            remaining = frame_size
+            chunk_size = 65536
+            while remaining > 0:
+                chunk = s.recv(min(remaining, chunk_size))
+                if not chunk:
+                    break
+                frame_data += chunk
+                remaining -= len(chunk)
+            
+            if len(frame_data) != frame_size:
+                raise ScreenError("Failed to receive frame data: expected %d, got %d" % (frame_size, len(frame_data)))
+            
+            LOGGING.debug("get_frame: received frame, size=%d" % len(frame_data))
+            
+            s.close()
+            nbsp.kill()
+            kill_proc(proc)
+            self.adb.remove_forward("tcp:%s" % localport)
+            
+            return frame_data
+            
+        except Exception as e:
+            LOGGING.debug("get_frame failed: %s", e)
+            self.teardown_stream()
+            raise ScreenError("minicap_apk get_frame failed: %s" % e)
 
     def _get_params(self, projection=None):
         """
@@ -221,60 +297,98 @@ class MinicapApk(BaseCap):
     @threadsafe_generator
     @on_method_ready("install_or_upgrade")
     def _get_stream(self, lazy=True):
+        """
+        Setup socket connection for lazy mode.
+        Simple flow: send request -> receive frame -> repeat
+        """
         self._cleanup_minicap()
         proc, nbsp, localport = self._setup_stream_server(lazy=lazy)
+        
         s = SafeSocket()
+        s.sock.settimeout(15)  # 15s timeout to prevent hang
         s.connect((self.adb.host, localport))
+        
+        # Receive banner (24 bytes)
         t = s.recv(24)
-        # minicap header
+        if len(t) != 24:
+            raise ScreenError("Failed to receive banner")
+        
+        # Parse header to get orientation and quirk
         global_headers = struct.unpack("<2B5I2B", t)
         LOGGING.debug(global_headers)
-        # check quirk-bitflags, reference: https://github.com/openstf/minicap#quirk-bitflags
         ori, self.quirk_flag = global_headers[-2:]
-
+        
+        # Optimization: For rotation=0, only b"1" is needed
+        # For rotation=90, need hybrid approach for first frame
+        self._use_hybrid_request = (ori != 0)
+        LOGGING.debug("lazy mode: ori=%d, use_hybrid=%s", ori, self._use_hybrid_request)
+        
+        # Check quirk
         if self.quirk_flag & 2 and ori in (1, 3):
-            # resetup
             LOGGING.debug("quirk_flag found, going to resetup")
             stopping = True
         else:
             stopping = False
+        
+        # Register cleanup
         self.cleanup_func.append(s.close)
         self.cleanup_func.append(nbsp.kill)
         self.cleanup_func.append(partial(kill_proc, proc))
         self.cleanup_func.append(partial(self.adb.remove_forward, "tcp:%s" % localport))
         yield stopping
-
-        # In lazy mode, need to send initial request to start the request-response cycle
+        
+        # In lazy mode, send initial request after yield
+        # Optimized: For rotation=0, only b"1" is needed; for rotation=90, need hybrid
         if lazy:
-            LOGGING.debug("lazy mode: sending initial request")
-            s.sock.send(b"1")
-            time.sleep(0.3)  # Wait for server to process
-
+            if self._use_hybrid_request:
+                LOGGING.debug("lazy mode: initial request (hybrid for ori=%d)", ori)
+                s.sock.send(b"1")
+                time.sleep(0.5)
+                s.sock.send(b'\x00')
+                time.sleep(0.5)
+            else:
+                LOGGING.debug("lazy mode: initial request (b'1' only for ori=0)")
+                s.sock.send(b"1")
+                time.sleep(0.5)
+        
+        # Main loop: send request -> receive frame
         try:
-            while not stopping:
+            while True:
                 if lazy:
-                    s.sock.send(b"1")
-                    LOGGING.debug("lazy mode: sent request, waiting for response")
-                # recv frame header, count frame_size
-                if self.RECVTIMEOUT is not None:
-                    header = s.recv_with_timeout(4, self.RECVTIMEOUT)
-                else:
-                    header = s.recv(4)
-                if header is None:
-                    LOGGING.error("minicap header is None")
-                    if self._update_rotation_event.is_set():
-                        LOGGING.debug("timeout due to rotation, teardown stream")
-                        self._update_rotation_event.clear()
-                        return
-                    stopping = yield None
-                else:
-                    frame_size = struct.unpack("<I", header)[0]
-                    if self.RECVTIMEOUT is not None:
-                        frame_data = s.recv_with_timeout(frame_size, self.RECVTIMEOUT)
+                    # Optimized: For rotation=0, only b"1" is needed after first frame
+                    if self._use_hybrid_request:
+                        s.sock.send(b"1")
+                        time.sleep(0.5)
+                        s.sock.send(b'\x00')
+                        time.sleep(0.5)
                     else:
-                        frame_data = s.recv(frame_size)
-                    LOGGING.debug("lazy mode: received frame, size=%d" % len(frame_data) if frame_data else "None")
-                    stopping = yield frame_data
+                        s.sock.send(b"1")
+                        time.sleep(0.5)
+                    LOGGING.debug("lazy mode: sent request")
+                
+                # Receive frame header (4 bytes) with timeout
+                s.sock.settimeout(15)
+                header = s.recv(4)
+                if len(header) != 4:
+                    LOGGING.error("Failed to receive frame header")
+                    break
+                
+                frame_size = struct.unpack("<I", header)[0]
+                if frame_size == 0:
+                    LOGGING.error("Invalid frame size: 0")
+                    break
+                
+                # Receive frame data
+                frame_data = s.recv(frame_size)
+                if len(frame_data) != frame_size:
+                    LOGGING.error("Failed to receive frame data")
+                    break
+                
+                LOGGING.debug("lazy mode: received frame, size=%d" % len(frame_data))
+                yield frame_data
+                
+        except Exception as e:
+            LOGGING.debug("Stream error: %s", e)
         finally:
             LOGGING.debug("minicap stream ends")
             self._cleanup()
@@ -311,13 +425,21 @@ class MinicapApk(BaseCap):
         nbsp = NonBlockingStreamReader(
             proc.stdout, print_output=True, name="minicap_apk_server", auto_kill=True
         )
-        while True:
-            line = nbsp.readline(timeout=5.0)
+        
+        # Wait for server to start, with timeout
+        start_time = time.time()
+        max_wait = 10  # 10 seconds max
+        while time.time() - start_time < max_wait:
+            line = nbsp.readline(timeout=1.0)
             if line is None:
-                kill_proc(proc)
-                raise RuntimeError("minicap-apk server setup timeout")
+                if proc.poll() is not None:
+                    raise RuntimeError("minicap-apk server quit immediately")
+                continue
             if b"Listening on socket : minicap_apk_" in line:
                 break
+        else:
+            kill_proc(proc)
+            raise RuntimeError("minicap-apk server setup timeout")
 
         if proc.poll() is not None:
             # minicap server setup error, may be already setup by others
@@ -349,8 +471,8 @@ class MinicapApk(BaseCap):
         # This allows the server to capture a new frame
         current_time = time.time()
         elapsed = current_time - getattr(self, '_last_request_time', current_time)
-        if elapsed < 1.5:
-            wait_time = 1.5 - elapsed
+        if elapsed < 0.1:
+            wait_time = 0.1 - elapsed
             LOGGING.debug("lazy mode: waiting %.2fs before next request" % wait_time)
             time.sleep(wait_time)
         
