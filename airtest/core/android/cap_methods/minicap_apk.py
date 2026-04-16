@@ -294,6 +294,43 @@ class MinicapApk(BaseCap):
 
         return gen
 
+    def _smart_recv(self, s, expected, max_wait=0.5, poll_interval=0.01):
+        """
+        Smart receive: try immediately first, then poll with select.
+
+        Args:
+            s: SafeSocket instance
+            expected: expected bytes to receive
+            max_wait: maximum time to wait for data
+            poll_interval: interval between polls
+
+        Returns:
+            received data or None on timeout/error
+        """
+        # Try immediate receive first (data might already be available)
+        data = s.recv(expected)
+        if len(data) == expected:
+            return data
+
+        # If not all data received, poll with select
+        start_time = time.time()
+        while time.time() - start_time < max_wait:
+            ready, _, _ = select.select([s.sock], [], [], poll_interval)
+            if ready:
+                remaining = expected - len(data)
+                chunk = s.recv(remaining)
+                if not chunk:
+                    return None
+                data += chunk
+                if len(data) == expected:
+                    return data
+            else:
+                # No data yet, continue polling
+                pass
+
+        # Return what we have (might be partial)
+        return data if data else None
+
     @threadsafe_generator
     @on_method_ready("install_or_upgrade")
     def _get_stream(self, lazy=True):
@@ -352,26 +389,35 @@ class MinicapApk(BaseCap):
                 time.sleep(0.5)
         
         # Main loop: send request -> receive frame
+        # Optimization: Use smart waiting instead of fixed sleep
         try:
             while True:
                 if lazy:
-                    # Optimized: For rotation=0, only b"1" is needed after first frame
+                    # Send request
                     if self._use_hybrid_request:
                         s.sock.send(b"1")
-                        time.sleep(0.5)
                         s.sock.send(b'\x00')
-                        time.sleep(0.5)
                     else:
                         s.sock.send(b"1")
-                        time.sleep(0.5)
                     LOGGING.debug("lazy mode: sent request")
-                
-                # Receive frame header (4 bytes) with timeout
-                s.sock.settimeout(15)
-                header = s.recv(4)
-                if len(header) != 4:
-                    LOGGING.error("Failed to receive frame header")
-                    break
+
+                    # Smart wait for data: try immediately first, then poll
+                    # Increase max_wait to 1s to match original behavior
+                    header = self._smart_recv(s, expected=4, max_wait=1.0)
+                    if header is None:
+                        # Timeout - continue loop to retry
+                        LOGGING.debug("lazy mode: header timeout, retrying...")
+                        continue
+                    if len(header) != 4:
+                        LOGGING.error("Failed to receive frame header")
+                        break
+                else:
+                    # Receive frame header (4 bytes) with timeout
+                    s.sock.settimeout(15)
+                    header = s.recv(4)
+                    if len(header) != 4:
+                        LOGGING.error("Failed to receive frame header")
+                        break
                 
                 frame_size = struct.unpack("<I", header)[0]
                 if frame_size == 0:
