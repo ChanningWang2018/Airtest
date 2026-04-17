@@ -130,115 +130,61 @@ class MinicapApk(BaseCap):
         LOGGING.info("minicap-debug.apk installation finished")
 
     @on_method_ready("install_or_upgrade")
-    def get_frame(self, projection=None):
+    def get_frame_via_stream(self, projection=None):
         """
-        Get a single frame using direct socket connection.
-        Simplified approach similar to reference test_lazy_mode.py:
-        1. Setup server
-        2. Connect socket
-        3. Send request
-        4. Receive frame
-        5. Cleanup
+        Get single frame using stream mode (reuses connection).
+
+        This method uses the existing stream connection if available,
+        or creates a new one. It's optimized for quick single captures.
+
+        Returns:
+            bytes: JPEG image data
+
+        Raises:
+            ScreenError: If screenshot fails
         """
+        # Ensure stream is ready
         if self._update_rotation_event.is_set():
-            LOGGING.debug("get_frame: rotation update, teardown")
+            LOGGING.debug("get_frame_via_stream: rotation update, resetting")
             self.teardown_stream()
             self._update_rotation_event.clear()
-        
+
         try:
-            self._cleanup_minicap()
-            proc, nbsp, localport = self._setup_stream_server(lazy=True)
-            
-            # Use plain socket instead of SafeSocket to avoid buffering issues
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(30)
-            s.connect((self.adb.host, localport))
-            LOGGING.debug("get_frame: connected to localhost:%d", localport)
-            
-            banner = s.recv(24)
-            LOGGING.debug("get_frame: received banner: %d bytes, first 10 bytes: %s", len(banner), banner[:10])
-            if len(banner) != 24:
-                raise ScreenError("Failed to receive banner: got %d bytes" % len(banner))
-            LOGGING.debug("get_frame: received banner, 24 bytes")
-            
-            # Parse banner and determine request pattern
-            try:
-                banner_data = struct.unpack("<2B5I2B", banner)
-                LOGGING.debug("get_frame: banner parsed - version=%d, screen=%dx%d, target=%dx%d, ori=%d, quirk=%d",
-                              banner_data[0], banner_data[3], banner_data[4], 
-                              banner_data[5], banner_data[6], banner_data[7], banner_data[8])
-                ori = banner_data[7]
-            except Exception as e:
-                LOGGING.debug("get_frame: failed to parse banner: %s", e)
-                ori = 1  # Default to non-zero rotation
-            
-            # Optimized request pattern based on rotation
-            use_hybrid = (ori != 0)
-            if use_hybrid:
-                # For rotation=90, need hybrid approach
-                LOGGING.debug("get_frame: sending b'1' to wake up server")
-                s.send(b"1")
-                time.sleep(0.5)
-                LOGGING.debug("get_frame: sending b'\\x00' to request frame")
-                s.send(b'\x00')
-                time.sleep(0.5)
-            else:
-                # For rotation=0, only b"1" is needed
-                LOGGING.debug("get_frame: sending b'1' to request frame")
-                s.send(b"1")
-                time.sleep(0.5)
-            
-            # Try reading - if fails, try sending again (like stream version does in loop)
-            LOGGING.debug("get_frame: attempting to receive frame header...")
-            
-            # Check if socket is still usable
-            if s._closed:
-                raise ScreenError("Socket was closed unexpectedly")
-            
-            # Set timeout for receive
-            s.settimeout(15)
-            LOGGING.debug("get_frame: waiting for frame header...")
-            
-            # Receive frame header (4 bytes)
-            s.settimeout(15)
-            header = s.recv(4)
-            LOGGING.debug("get_frame: received header: %d bytes", len(header))
-            if len(header) != 4:
-                raise ScreenError("Failed to receive frame header: got %d bytes" % len(header))
-            
-            frame_size = struct.unpack("<I", header)[0]
-            LOGGING.debug("get_frame: frame header received, size=%d", frame_size)
-            if frame_size == 0:
-                raise ScreenError("Invalid frame size: 0")
-            
-            # Receive frame data with chunked reading for large frames
-            LOGGING.debug("get_frame: receiving frame data (%d bytes)...", frame_size)
-            frame_data = b""
-            remaining = frame_size
-            chunk_size = 65536
-            while remaining > 0:
-                chunk = s.recv(min(remaining, chunk_size))
-                if not chunk:
-                    break
-                frame_data += chunk
-                remaining -= len(chunk)
-            
-            if len(frame_data) != frame_size:
-                raise ScreenError("Failed to receive frame data: expected %d, got %d" % (frame_size, len(frame_data)))
-            
-            LOGGING.debug("get_frame: received frame, size=%d" % len(frame_data))
-            
-            s.close()
-            nbsp.kill()
-            kill_proc(proc)
-            self.adb.remove_forward("tcp:%s" % localport)
-            
-            return frame_data
-            
+            # Use stream mode (creates connection if needed)
+            if self.frame_gen is None:
+                self.frame_gen = self.get_stream(lazy=True)
+                next(self.frame_gen)  # Prime the generator
+
+            # Get frame from stream
+            frame = next(self.frame_gen)
+            if frame is None:
+                raise ScreenError("get_frame_via_stream: stream returned None")
+
+            return frame
+
+        except StopIteration:
+            self.frame_gen = None
+            raise ScreenError("get_frame_via_stream: stream ended")
         except Exception as e:
-            LOGGING.debug("get_frame failed: %s", e)
-            self.teardown_stream()
-            raise ScreenError("minicap_apk get_frame failed: %s" % e)
+            self.frame_gen = None
+            LOGGING.debug("get_frame_via_stream failed: %s", e)
+            raise ScreenError("get_frame_via_stream failed: %s" % e)
+
+    @on_method_ready("install_or_upgrade")
+    def get_frame(self, projection=None):
+        """
+        Get a single frame from minicap.
+
+        This method uses the stream-based approach for better performance
+        on slow devices. The connection is reused if already established.
+
+        Returns:
+            bytes: JPEG image data
+
+        Raises:
+            ScreenError: If screenshot fails
+        """
+        return self.get_frame_via_stream()
 
     def _get_params(self, projection=None):
         """
@@ -307,29 +253,41 @@ class MinicapApk(BaseCap):
         Returns:
             received data or None on timeout/error
         """
-        # Try immediate receive first (data might already be available)
-        data = s.recv(expected)
-        if len(data) == expected:
-            return data
+        # Save and temporarily increase socket timeout to prevent interruption
+        old_timeout = s.sock.gettimeout()
+        if old_timeout is None or old_timeout < max_wait:
+            s.sock.settimeout(max_wait + 1)
 
-        # If not all data received, poll with select
-        start_time = time.time()
-        while time.time() - start_time < max_wait:
-            ready, _, _ = select.select([s.sock], [], [], poll_interval)
-            if ready:
-                remaining = expected - len(data)
-                chunk = s.recv(remaining)
-                if not chunk:
-                    return None
-                data += chunk
-                if len(data) == expected:
-                    return data
-            else:
-                # No data yet, continue polling
-                pass
+        try:
+            # Try immediate receive first (data might already be available)
+            data = s.recv(expected)
+            if len(data) == expected:
+                return data
 
-        # Return what we have (might be partial)
-        return data if data else None
+            # If not all data received, poll with select
+            start_time = time.time()
+            while time.time() - start_time < max_wait:
+                ready, _, _ = select.select([s.sock], [], [], poll_interval)
+                if ready:
+                    remaining = expected - len(data)
+                    chunk = s.recv(remaining)
+                    if not chunk:
+                        return None
+                    data += chunk
+                    if len(data) == expected:
+                        return data
+                else:
+                    # No data yet, continue polling
+                    pass
+
+            # Return what we have (might be partial)
+            return data if data else None
+        except socket.timeout:
+            # Socket timed out during receive
+            return None
+        finally:
+            # Restore original timeout
+            s.sock.settimeout(old_timeout)
 
     @threadsafe_generator
     @on_method_ready("install_or_upgrade")
@@ -402,8 +360,8 @@ class MinicapApk(BaseCap):
                     LOGGING.debug("lazy mode: sent request")
 
                     # Smart wait for data: try immediately first, then poll
-                    # Increase max_wait to 1s to match original behavior
-                    header = self._smart_recv(s, expected=4, max_wait=1.0)
+                    # Initial connection needs longer wait (up to 20s for slow devices)
+                    header = self._smart_recv(s, expected=4, max_wait=20.0)
                     if header is None:
                         # Timeout - continue loop to retry
                         LOGGING.debug("lazy mode: header timeout, retrying...")
