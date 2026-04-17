@@ -431,8 +431,9 @@ class MinicapApk(BaseCap):
         )
         
         # Wait for server to start, with timeout
+        # Some devices/emulators need more time to start the server (up to 60s)
         start_time = time.time()
-        max_wait = 10  # 10 seconds max
+        max_wait = 60  # 60 seconds max for slow devices
         while time.time() - start_time < max_wait:
             line = nbsp.readline(timeout=1.0)
             if line is None:
