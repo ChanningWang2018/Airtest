@@ -1,52 +1,35 @@
 # -*- coding: utf-8 -*-
+import hashlib
 import os
-import select
-import socket
+import re
 import struct
-import threading
 import time
-import traceback
-from functools import partial, wraps
+from functools import partial
 
 import six
 
-from airtest import aircv
-from airtest.core.android.cap_methods.base_cap import BaseCap
+from airtest.core.android.cap_methods.minicap_base import (
+    MinicapBase,
+    retry_when_socket_error_with_backoff as retry_when_socket_error,
+)
 from airtest.core.error import ScreenError
 from airtest.utils.logger import get_logger
 from airtest.utils.nbsp import NonBlockingStreamReader
 from airtest.utils.safesocket import SafeSocket
-from airtest.utils.snippet import kill_proc, on_method_ready, ready_method, reg_cleanup
+from airtest.utils.snippet import kill_proc, on_method_ready, ready_method
 from airtest.utils.threadsafe import threadsafe_generator
 
 LOGGING = get_logger(__name__)
 
 
-def retry_when_socket_error(func, max_retries=3):
-    @wraps(func)
-    def wrapper(inst, *args, **kwargs):
-        for attempt in range(max_retries):
-            try:
-                return func(inst, *args, **kwargs)
-            except socket.error:
-                LOGGING.warning("socket error on attempt %d/%d, retrying..." % (attempt + 1, max_retries))
-                inst.frame_gen = None
-                if attempt < max_retries - 1:
-                    time.sleep(0.5 * (2 ** attempt))
-        return func(inst, *args, **kwargs)
-
-    return wrapper
-
-
-class MinicapApk(BaseCap):
+class MinicapApk(MinicapBase):
     """minicap-debug.apk based screenshot method, compatible with minicap options.
 
-    reference https://github.com/openstf/minicap
+    reference https://github.com/ChanningWang2018/minicap
     """
 
-    VERSION = 5
     RECVTIMEOUT = (
-        5  # 5s timeout
+        3  # server waits at most 2s for a requested frame, so client timeout is 3s
     )
     CMD = "CLASSPATH=/data/local/tmp/minicap-debug.apk app_process /system/bin io.devicefarmer.minicap.Main"
     APK_PATH = "/data/local/tmp/minicap-debug.apk"
@@ -63,22 +46,14 @@ class MinicapApk(BaseCap):
         :param adb: adb instance of android device
         :param projection: projection, default is None. If `None`, physical display size is used
         """
-        super(MinicapApk, self).__init__(adb=adb)
-        self.projection = projection
-        self.display_id = display_id
-        self.ori_function = ori_function or self.adb.get_display_info
-        self.frame_gen = None
-        self.stream_lock = threading.Lock()
-        self.quirk_flag = 0
-        self._stream_rotation = None
-        self._update_rotation_event = threading.Event()
-        if rotation_watcher:
-            # Minicap needs to be reconnected when switching between landscape and portrait
-            # minicap需要在横竖屏转换时，重新连接
-            rotation_watcher.reg_callback(lambda x: self.update_rotation(x * 90))
-        self.cleanup_func = []
-        # Force cleanup on exit
-        reg_cleanup(self.teardown_stream)
+        super(MinicapApk, self).__init__(
+            adb=adb,
+            projection=projection,
+            rotation_watcher=rotation_watcher,
+            display_id=display_id,
+            ori_function=ori_function,
+        )
+        self._stream_projection = None
 
     @ready_method
     def install_or_upgrade(self):
@@ -89,12 +64,59 @@ class MinicapApk(BaseCap):
             None
 
         """
-        if self.adb.exists_file(self.APK_PATH):
-            LOGGING.debug("minicap-debug.apk already exists, skip installation")
+        if self._apk_is_up_to_date():
+            LOGGING.debug("minicap-debug.apk already up to date, skip installation")
             return
-        else:
-            LOGGING.debug("install minicap-debug.apk")
+        LOGGING.debug("install minicap-debug.apk")
         self.install()
+
+    def _local_apk_path(self):
+        """
+        Get the local minicap-debug.apk path shipped with airtest
+
+        Returns:
+            local apk file path
+
+        """
+        from airtest.core.android.constant import STATICPATH
+
+        return os.path.join(STATICPATH, "apks", "minicap-debug.apk")
+
+    def _apk_is_up_to_date(self):
+        """
+        Check whether the apk on device is the same as the local one by md5.
+
+        When the `md5sum` command is not available on device, fall back to
+        the exists-file check.
+
+        Returns:
+            True if the device apk is up to date
+
+        """
+        if not self.adb.exists_file(self.APK_PATH):
+            return False
+        try:
+            md5 = hashlib.md5()
+            with open(self._local_apk_path(), "rb") as f:
+                for chunk in iter(lambda: f.read(8192), b""):
+                    md5.update(chunk)
+            local_md5 = md5.hexdigest()
+            # md5sum output looks like: "<md5>  /data/local/tmp/minicap-debug.apk"
+            output = self.adb.shell("md5sum %s" % self.APK_PATH)
+            device_md5 = output.strip().split()[0]
+        except Exception as e:
+            LOGGING.debug("md5 check failed, fallback to exists check: %s", e)
+            return True
+        if not re.match(r"^[0-9a-fA-F]{32}$", device_md5):
+            LOGGING.debug("unexpected md5sum output, fallback to exists check: %r" % output)
+            return True
+        if local_md5 == device_md5:
+            return True
+        LOGGING.info(
+            "minicap-debug.apk md5 mismatch (local: %s, device: %s), upgrading"
+            % (local_md5, device_md5)
+        )
+        return False
 
     def uninstall(self):
         """
@@ -118,9 +140,7 @@ class MinicapApk(BaseCap):
             None
 
         """
-        from airtest.core.android.constant import STATICPATH
-
-        local_apk_path = os.path.join(STATICPATH, "apks", "minicap-debug.apk")
+        local_apk_path = self._local_apk_path()
 
         if not os.path.exists(local_apk_path):
             raise RuntimeError("minicap-debug.apk not found at %s" % local_apk_path)
@@ -137,272 +157,163 @@ class MinicapApk(BaseCap):
         This method uses the existing stream connection if available,
         or creates a new one. It's optimized for quick single captures.
 
+        Args:
+            projection: screenshot projection, when it differs from the projection
+                the current stream was built with, the stream is rebuilt with it
+
         Returns:
             bytes: JPEG image data
 
         Raises:
             ScreenError: If screenshot fails
+
         """
-        # Ensure stream is ready
-        if self._update_rotation_event.is_set():
-            LOGGING.debug("get_frame_via_stream: rotation update, resetting")
+        effective_projection = projection or self.projection
+        if tuple(effective_projection or ()) != tuple(self._stream_projection or ()):
+            LOGGING.debug(
+                "projection changed %s -> %s, rebuild stream"
+                % (self._stream_projection, effective_projection)
+            )
             self.teardown_stream()
-            self._update_rotation_event.clear()
-
-        try:
-            # Use stream mode (creates connection if needed)
-            if self.frame_gen is None:
-                self.frame_gen = self.get_stream(lazy=True)
-                next(self.frame_gen)  # Prime the generator
-
-            # Get frame from stream
-            frame = next(self.frame_gen)
-            if frame is None:
-                raise ScreenError("get_frame_via_stream: stream returned None")
-
-            return frame
-
-        except StopIteration:
-            self.frame_gen = None
-            raise ScreenError("get_frame_via_stream: stream ended")
-        except Exception as e:
-            self.frame_gen = None
-            LOGGING.debug("get_frame_via_stream failed: %s", e)
-            raise ScreenError("get_frame_via_stream failed: %s" % e)
+        return self._fetch_stream_frame(projection=projection, raise_on_failure=True)
 
     @on_method_ready("install_or_upgrade")
     def get_frame(self, projection=None):
         """
-        Get a single frame from minicap.
+        Get a single frame from minicap-debug.apk via the lazy stream.
 
-        This method uses the stream-based approach for better performance
-        on slow devices. The connection is reused if already established.
+        The stream connection is reused when possible, which is faster than
+        starting a shell process for every capture.
+
+        Args:
+            projection: screenshot projection, default is None which means using self.projection
 
         Returns:
-            bytes: JPEG image data
+            jpg data
 
         Raises:
             ScreenError: If screenshot fails
-        """
-        return self.get_frame_via_stream()
-
-    def _get_params(self, projection=None):
-        """
-        Get the minicap origin parameters and count the projection
-
-        Returns:
-            physical display size (width, height), counted projection (width, height) and real display orientation
 
         """
-        display_info = self.ori_function()
-        real_width = display_info["width"]
-        real_height = display_info["height"]
-        real_rotation = display_info["rotation"]
-        # 优先去传入的projection
-        projection = projection or self.projection
-        if projection:
-            proj_width, proj_height = projection
-        else:
-            proj_width, proj_height = real_width, real_height
+        return self.get_frame_via_stream(projection=projection)
 
-        if self.quirk_flag & 2 and real_rotation in (90, 270):
-            params = real_height, real_width, proj_height, proj_width, 0
-        else:
-            params = real_width, real_height, proj_width, proj_height, real_rotation
-
-        return (params, display_info)
-
-    @on_method_ready("install_or_upgrade")
-    def get_stream(self, lazy=True):
+    def _fetch_stream_frame(self, projection=None, raise_on_failure=True):
         """
-        Get stream, it uses `adb forward`and socket communication. Use minicap ``lazy``mode (provided by gzmaruijie)
-        for long connections - returns one latest frame from the server
-
+        Get one frame from the lazy stream, shared by `get_frame_via_stream` and
+        `get_frame_from_stream`. Handles rotation events and the frame generator
+        lifecycle, with bounded retries when no frame is received (e.g. screen locked).
 
         Args:
-            lazy: True or False
+            projection: projection used when the stream needs to be (re)built
+            raise_on_failure: True to raise ScreenError when no frame is received,
+                False to return None (recorder callers tolerate missing frames)
 
         Returns:
+            frame data, or None when unavailable and `raise_on_failure` is False
+
+        Raises:
+            ScreenError: when no frame is received and `raise_on_failure` is True
 
         """
-        gen = self._get_stream(lazy)
-
-        # if quirk error, restart server and client once
-        stopped = next(gen)
-
-        if stopped:
+        max_attempts = 3  # 1 initial + 2 retries, the screen may be locked
+        for attempt in range(max_attempts):
+            if self._update_rotation_event.is_set():
+                LOGGING.debug("do update rotation")
+                self.teardown_stream()
+                self._update_rotation_event.clear()
+            frame = None
+            if self.frame_gen is None:
+                # get_stream consumes the first `yield stopping` internally,
+                # no extra prime next() is needed
+                self.frame_gen = self.get_stream(lazy=True, projection=projection)
             try:
-                next(gen)
+                frame = six.next(self.frame_gen)
             except StopIteration:
-                pass
-            gen = self._get_stream(lazy)
-            next(gen)
-
-        return gen
-
-    def _smart_recv(self, s, expected, max_wait=0.5, poll_interval=0.01):
-        """
-        Smart receive: try immediately first, then poll with select.
-
-        Args:
-            s: SafeSocket instance
-            expected: expected bytes to receive
-            max_wait: maximum time to wait for data
-            poll_interval: interval between polls
-
-        Returns:
-            received data or None on timeout/error
-        """
-        # Save and temporarily increase socket timeout to prevent interruption
-        old_timeout = s.sock.gettimeout()
-        if old_timeout is None or old_timeout < max_wait:
-            s.sock.settimeout(max_wait + 1)
-
-        try:
-            # Try immediate receive first (data might already be available)
-            data = s.recv(expected)
-            if len(data) == expected:
-                return data
-
-            # If not all data received, poll with select
-            start_time = time.time()
-            while time.time() - start_time < max_wait:
-                ready, _, _ = select.select([s.sock], [], [], poll_interval)
-                if ready:
-                    remaining = expected - len(data)
-                    chunk = s.recv(remaining)
-                    if not chunk:
-                        return None
-                    data += chunk
-                    if len(data) == expected:
-                        return data
-                else:
-                    # No data yet, continue polling
-                    pass
-
-            # Return what we have (might be partial)
-            return data if data else None
-        except socket.timeout:
-            # Socket timed out during receive
-            return None
-        finally:
-            # Restore original timeout
-            s.sock.settimeout(old_timeout)
+                # generator ended (e.g. timeout due to rotation), rebuild on next attempt
+                LOGGING.debug("minicap stream generator ended, will rebuild")
+                self.frame_gen = None
+            if frame is not None:
+                return frame
+            LOGGING.debug("no frame received (attempt %d/%d)" % (attempt + 1, max_attempts))
+            if attempt < max_attempts - 1:
+                time.sleep(0.5)
+        if raise_on_failure:
+            raise ScreenError("minicap_apk: no frame received from stream")
+        return None
 
     @threadsafe_generator
     @on_method_ready("install_or_upgrade")
-    def _get_stream(self, lazy=True):
+    def _get_stream(self, lazy=True, projection=None):
         """
         Setup socket connection for lazy mode.
         Simple flow: send request -> receive frame -> repeat
         """
         self._cleanup_minicap()
-        proc, nbsp, localport = self._setup_stream_server(lazy=lazy)
-        
+        proc, nbsp, localport = self._setup_stream_server(lazy=lazy, projection=projection)
         s = SafeSocket()
-        s.sock.settimeout(15)  # 15s timeout to prevent hang
-        s.connect((self.adb.host, localport))
-        
-        # Receive banner (24 bytes)
-        t = s.recv(24)
-        if len(t) != 24:
-            raise ScreenError("Failed to receive banner")
-        
-        # Parse header to get orientation and quirk
-        global_headers = struct.unpack("<2B5I2B", t)
-        LOGGING.debug(global_headers)
-        ori, self.quirk_flag = global_headers[-2:]
-        
-        # Optimization: For rotation=0, only b"1" is needed
-        # For rotation=90, need hybrid approach for first frame
-        self._use_hybrid_request = (ori != 0)
-        LOGGING.debug("lazy mode: ori=%d, use_hybrid=%s", ori, self._use_hybrid_request)
-        
-        # Check quirk
-        if self.quirk_flag & 2 and ori in (1, 3):
-            LOGGING.debug("quirk_flag found, going to resetup")
-            stopping = True
-        else:
-            stopping = False
-        
-        # Register cleanup
+        # register cleanups before connecting, so that a connect/banner failure
+        # cannot leak the server process, the socket or the port forward
         self.cleanup_func.append(s.close)
         self.cleanup_func.append(nbsp.kill)
         self.cleanup_func.append(partial(kill_proc, proc))
         self.cleanup_func.append(partial(self.adb.remove_forward, "tcp:%s" % localport))
-        yield stopping
-        
-        # In lazy mode, send initial request after yield
-        # Optimized: For rotation=0, only b"1" is needed; for rotation=90, need hybrid
-        if lazy:
-            if self._use_hybrid_request:
-                LOGGING.debug("lazy mode: initial request (hybrid for ori=%d)", ori)
-                s.sock.send(b"1")
-                time.sleep(0.5)
-                s.sock.send(b'\x00')
-                time.sleep(0.5)
-            else:
-                LOGGING.debug("lazy mode: initial request (b'1' only for ori=0)")
-                s.sock.send(b"1")
-                time.sleep(0.5)
-        
-        # Main loop: send request -> receive frame
-        # Optimization: Use smart waiting instead of fixed sleep
         try:
-            while True:
-                if lazy:
-                    # Send request
-                    if self._use_hybrid_request:
-                        s.sock.send(b"1")
-                        s.sock.send(b'\x00')
-                    else:
-                        s.sock.send(b"1")
-                    LOGGING.debug("lazy mode: sent request")
+            s.connect((self.adb.host, localport))
+            t = s.recv(24)
+            # minicap header
+            global_headers = struct.unpack("<2B5I2B", t)
+            LOGGING.debug(global_headers)
+            # check quirk-bitflags, reference: https://github.com/openstf/minicap#quirk-bitflags
+            ori, self.quirk_flag = global_headers[-2:]
 
-                    # Smart wait for data: try immediately first, then poll
-                    # Initial connection needs longer wait (up to 20s for slow devices)
-                    header = self._smart_recv(s, expected=4, max_wait=20.0)
-                    if header is None:
-                        # Timeout - continue loop to retry
-                        LOGGING.debug("lazy mode: header timeout, retrying...")
-                        continue
-                    if len(header) != 4:
-                        LOGGING.error("Failed to receive frame header")
-                        break
+            if self.quirk_flag & 2 and ori in (1, 3):
+                # resetup
+                LOGGING.debug("quirk_flag found, going to resetup")
+                stopping = True
+            else:
+                stopping = False
+
+            yield stopping
+
+            while not stopping:
+                if lazy:
+                    s.send(b"1")
+                # recv frame header, count frame_size
+                if self.RECVTIMEOUT is not None:
+                    # Some mobile phones may keep waiting for data when switching between horizontal and vertical screens,
+                    # and the connection is not closed, resulting in a black screen
+                    # Set the timeout to 3s(airtest>=1.2.7)
+                    header = s.recv_with_timeout(4, self.RECVTIMEOUT)
                 else:
-                    # Receive frame header (4 bytes) with timeout
-                    s.sock.settimeout(15)
                     header = s.recv(4)
-                    if len(header) != 4:
-                        LOGGING.error("Failed to receive frame header")
-                        break
-                
-                frame_size = struct.unpack("<I", header)[0]
-                if frame_size == 0:
-                    LOGGING.error("Invalid frame size: 0")
-                    break
-                
-                # Receive frame data
-                frame_data = s.recv(frame_size)
-                if len(frame_data) != frame_size:
-                    LOGGING.error("Failed to receive frame data")
-                    break
-                
-                LOGGING.debug("lazy mode: received frame, size=%d" % len(frame_data))
-                yield frame_data
-                
-        except Exception as e:
-            LOGGING.debug("Stream error: %s", e)
+                if header is None:
+                    LOGGING.error("minicap header is None")
+                    # recv timeout, check if due to rotation
+                    if self._update_rotation_event.is_set():
+                        LOGGING.debug("timeout due to rotation, teardown stream")
+                        self._update_rotation_event.clear()
+                        # Signal generator to stop and trigger reconnection
+                        return
+                    # recv timeout, if not frame updated, maybe screen locked
+                    stopping = yield None
+                else:
+                    frame_size = struct.unpack("<I", header)[0]
+                    if self.RECVTIMEOUT is not None:
+                        frame_data = s.recv_with_timeout(frame_size, self.RECVTIMEOUT)
+                    else:
+                        frame_data = s.recv(frame_size)
+                    stopping = yield frame_data
         finally:
             LOGGING.debug("minicap stream ends")
             self._cleanup()
 
-    def _setup_stream_server(self, lazy=True):
+    def _setup_stream_server(self, lazy=True, projection=None):
         """
         Setup minicap-debug.apk process on device
 
         Args:
             lazy: parameter `-l` is used when True
+            projection: projection used to setup the server, default is None which means using self.projection
 
         Returns:
             adb shell process, non-blocking stream reader and local port
@@ -413,23 +324,13 @@ class MinicapApk(BaseCap):
         )
         deviceport = deviceport[len("localabstract:") :]
         other_opt = "-l" if lazy else "-r 30"  # lazy mode or frame rate
-        params, display_info = self._get_params()
-        if self.display_id:
-            proc = self.adb.start_shell(
-                "%s -d %s -n '%s' -P %dx%d@%dx%d/%d %s 2>&1"
-                % tuple(
-                    [self.CMD, self.display_id, deviceport] + list(params) + [other_opt]
-                ),
-            )
-        else:
-            proc = self.adb.start_shell(
-                "%s -n '%s' -P %dx%d@%dx%d/%d %s 2>&1"
-                % tuple([self.CMD, deviceport] + list(params) + [other_opt]),
-            )
+        params, display_info = self._get_params(projection)
+        self._stream_projection = projection or self.projection
+        proc = self._start_stream_proc(deviceport, params, other_opt)
         nbsp = NonBlockingStreamReader(
             proc.stdout, print_output=True, name="minicap_apk_server", auto_kill=True
         )
-        
+
         # Wait for server to start, with timeout
         # Some devices/emulators need more time to start the server (up to 60s)
         start_time = time.time()
@@ -452,7 +353,6 @@ class MinicapApk(BaseCap):
             kill_proc(proc)
             raise RuntimeError("minicap-apk server quit immediately")
 
-        self._stream_rotation = int(display_info["rotation"])
         return proc, nbsp, localport
 
     @retry_when_socket_error
@@ -461,72 +361,10 @@ class MinicapApk(BaseCap):
         Get one frame from minicap stream
 
         Returns:
-            frame
+            frame, None when no frame is received (e.g. screen locked)
 
         """
-        if self._update_rotation_event.is_set():
-            LOGGING.debug("do update rotation")
-            self.teardown_stream()
-            self._update_rotation_event.clear()
-        if self.frame_gen is None:
-            self.frame_gen = self.get_stream(True)
-            self._last_request_time = time.time()
-        
-        # In lazy mode, ensure minimum interval between requests
-        # This allows the server to capture a new frame
-        current_time = time.time()
-        elapsed = current_time - getattr(self, '_last_request_time', current_time)
-        if elapsed < 0.1:
-            wait_time = 0.1 - elapsed
-            LOGGING.debug("lazy mode: waiting %.2fs before next request" % wait_time)
-            time.sleep(wait_time)
-        
-        frame = six.next(self.frame_gen)
-        
-        if frame is None:
-            LOGGING.debug("received None frame, reconnecting")
-            self.frame_gen = None
-            return self.get_frame_from_stream()
-        
-        self._last_request_time = time.time()
-        return frame
-
-    def snapshot(self, ensure_orientation=True, projection=None):
-        """
-
-        Args:
-            ensure_orientation: True or False whether to keep the orientation same as display
-            projection: the size of the desired projection, (width, height)
-
-        Returns:
-
-        """
-        if projection:
-            # minicap模式在单张截图时，可以传入projection参数来强制指定图片大小，如手机分辨率(width, height)
-            screen = self.get_frame(projection=projection)
-            try:
-                screen = aircv.utils.string_2_img(screen)
-            except Exception:
-                # may be black/locked screen or other reason, print exc for debugging
-                traceback.print_exc()
-                return None
-            return screen
-        else:
-            return super(MinicapApk, self).snapshot()
-
-    def update_rotation(self, rotation):
-        """
-        Update rotation and reset the backend stream generator
-
-        Args:
-            rotation: rotation input
-
-        Returns:
-            None
-
-        """
-        LOGGING.debug("update_rotation: %s" % rotation)
-        self._update_rotation_event.set()
+        return self._fetch_stream_frame(raise_on_failure=False)
 
     def _cleanup_minicap(self):
         """
@@ -577,23 +415,5 @@ class MinicapApk(BaseCap):
                 LOGGING.debug("Cleanup func failed: %s", e)
         self.cleanup_func = []
 
-    def teardown_stream(self):
-        """
-        End the stream
-
-        Returns:
-            None
-
-        """
-        # clean up established connections
-        self._cleanup()
-        if not self.frame_gen:
-            return
-        try:
-            self.frame_gen.send(1)
-        except (TypeError, StopIteration):
-            # TypeError: can't send non-None value to a just-started generator
-            pass
-        else:
-            LOGGING.warn("%s tear down failed" % self.frame_gen)
-        self.frame_gen = None
+    def _reset_stream_state(self):
+        self._stream_projection = None
