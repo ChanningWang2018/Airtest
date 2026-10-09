@@ -71,3 +71,6 @@ Pipfile.lock
 .gemini/
 .venv/
 tests/lazy_captures/
+output/
+tests/benchmark_results/
+tests/screenshot_test_results/
