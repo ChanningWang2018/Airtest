@@ -4,24 +4,30 @@
 
 This document describes the lazy mode implementation for the experimental Kotlin-based minicap and the complete build process.
 
+## APK Source
+
+- Upstream: https://github.com/ChanningWang2018/minicap (fork of DeviceFarmer/minicap)
+- Prebuilt APK: `experimental/app/prebuild/minicap-debug.apk` in the fork repository
+- Reference Python client: `experimental/server/minicap_apk.py` in the fork repository (local copy in this repo: `reference/minicap_apk_fork_client.py`)
+
 ## Lazy Mode Implementation
 
 ### What is Lazy Mode
 
 Lazy mode (`-l` flag) is a pull-based screen capture mode where:
 - Server captures frames only when client requests them
-- Client sends 1 byte to request each frame
+- Client sends a single byte `b"1"` to request each frame
 - Server uses `ImageReader.acquireLatestImage()` to get the latest frame (automatically discards intermediate frames)
 - Much more efficient for use cases that don't need continuous streaming
 
-### Protocol Flow (Lazy Mode)
+### Protocol (Lazy Mode)
 
-```
-1. Client connects → Server sends banner (24 bytes)
-2. Client sends 1 byte (frame request)
-3. Server: captureLatestFrame() → encode → send frame (4 bytes size + JPEG data)
-4. Repeat from step 2
-```
+- On connect, the server sends a 24-byte banner in the standard minicap format (`<2B5I2B>`).
+- Lazy mode is strictly request/response: the client sends a single byte `b"1"` before each frame, and the server replies with one frame (4-byte little-endian length + JPEG data).
+- After a request, the server waits up to 2s for the first frame; if none arrives, the request is dropped and nothing is sent. The client receive timeout should therefore be 3s.
+- No interval throttling is needed between requests: `-r` only controls how often the server-side cached bitmap is refreshed.
+- There is NO hybrid request protocol (no combined `b"1"` + `b"\x00"` request, no extra prime bytes). Send `b"1"` only, one byte per frame.
+- Entry point: `io.devicefarmer.minicap.Main`, launched via `app_process` (see Usage below).
 
 ### Code Changes
 
@@ -173,6 +179,14 @@ adb shell CLASSPATH=/data/local/tmp/minicap.apk app_process /system/bin \
 -d <id>:       Display ID. (0)
 -n <name>:     Change the name of the abstract unix domain socket. (minicap)
 -P <value>:    Display projection (<w>x<h>@<w>x<h>/{0|90|180|270}).
+               The requested target size is honored EXACTLY in encoded frames
+               (lazy, push and -s modes): the capture buffer keeps the display
+               aspect ratio and the bitmap is rescaled to the exact requested
+               size right before JPEG encoding (no rescale if the aspects
+               already match). Pass --fit-projection to restore the legacy
+               behavior of fitting the target to the display aspect ratio
+               (e.g. @360x640 on a 16:9 display yields 360x203 frames).
+--fit-projection: Legacy fit-to-aspect projection mode (see -P above).
 -Q <value>:    JPEG quality (0-100).
 -s:            Take a screenshot and output it to stdout. Needs -P.
 -S:            Skip frames when they cannot be consumed quickly enough.
@@ -192,23 +206,26 @@ import struct
 def connect_minicap_lazy(socket_path):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.connect(socket_path)
-    
-    # Read banner (24 bytes)
+    s.settimeout(3)  # server may take up to 2s for the first frame
+
+    # Read banner (24 bytes, standard minicap format)
     banner = s.recv(24)
     version, size, pid, screen_w, screen_h, target_w, target_h, rotation, quirk = \
-        struct.unpack('<BBIIIHHBB', banner)
-    
+        struct.unpack('<2B5I2B', banner)
+
     while True:
-        # Send 1 byte request
-        s.send(b'\x00')
-        
-        # Read frame size (4 bytes)
+        # Send single-byte frame request
+        s.send(b'1')
+
+        # Read frame size (4 bytes, little-endian)
         size_data = s.recv(4)
+        if len(size_data) < 4:
+            continue  # request dropped, no frame arrived within 2s
         frame_size = struct.unpack('<I', size_data)[0]
-        
-        # Read frame data
+
+        # Read frame data (JPEG)
         frame = s.recv(frame_size)
-        
+
         # Process frame (e.g., decode JPEG)
         yield frame
 
@@ -258,6 +275,8 @@ for frame in connect_minicap_lazy('/tmp/minicap'):
 
 ## References
 
+- APK source: https://github.com/ChanningWang2018/minicap (fork of DeviceFarmer/minicap)
+- Reference client: `experimental/server/minicap_apk.py` in the fork repository (local copy: `reference/minicap_apk_fork_client.py`)
 - Original minicap binary: `/mnt/workspace/minicap/jni/minicap/`
 - Android SurfaceControl API (private)
 - Minicap protocol: 24-byte banner + frame data with 4-byte size prefix

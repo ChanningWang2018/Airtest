@@ -73,7 +73,17 @@ class ScreenProxy(object):
 
         按优先顺序，尝试初始化注册过的所有屏幕截图方法，选择一个可用方法返回
 
-        Custom method 自定义方法 > MINICAP > JAVACAP > ADBCAP
+        Selection iterates SCREEN_METHODS in reverse registration order, so the
+        effective fallback priority is:
+
+        default_method 自定义方法 > MINICAP > MINICAP_APK > JAVACAP > ADBCAP
+
+        MINICAP_APK takes screenshots via minicap-debug.apk (an app_process
+        wrapper that needs no prebuilt .so), and works on devices where native
+        minicap binaries are unavailable.
+
+        MINICAP_APK 通过 minicap-debug.apk（app_process 方式启动，无需预编译 .so）
+        截图，适用于原生 minicap 二进制不可用的设备。
 
         Args:
             adb: :py:mod:`airtest.core.android.adb.ADB`
@@ -113,7 +123,8 @@ class ScreenProxy(object):
 
 
 def register_screen():
-    # 按优先级逆序注册默认的屏幕截图方法
+    # 从低到高优先级逆序注册默认的屏幕截图方法；
+    # auto_setup 逆序遍历，实际优先级为 MINICAP > MINICAP_APK > JAVACAP > ADBCAP
     from airtest.core.android.cap_methods.adbcap import AdbCap
     from airtest.core.android.cap_methods.javacap import Javacap
     from airtest.core.android.cap_methods.minicap import Minicap

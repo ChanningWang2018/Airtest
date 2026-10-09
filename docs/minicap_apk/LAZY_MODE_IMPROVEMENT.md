@@ -1,5 +1,7 @@
 # MinicapApk Lazy Mode 改进设计方案
 
+> **状态注记（2026-10-09）**：本文所述方案已被新的 minicap APK（https://github.com/ChanningWang2018/minicap fork）+ 配套参考客户端（`reference/minicap_apk_fork_client.py`）的组合取代。文中从未落地的 `diagnose()`、`get_frame_on_demand()` 等项已废弃，不再实施。当前实现状态见 `docs/minicap_apk/REFACTOR_TICKETS.md` 与 `docs/minicap_apk/BUILD_GUIDE.md`，以下正文仅作历史记录保留。
+
 ## 问题概述
 
 ### 问题1: 流模式帧积压问题
