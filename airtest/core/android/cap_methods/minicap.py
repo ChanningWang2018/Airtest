@@ -1,38 +1,26 @@
 ﻿# -*- coding: utf-8 -*-
 import os
 import re
-import traceback
 import struct
 import threading
 import six
-import socket
-from functools import wraps, partial
+from functools import partial
 from airtest.core.android.constant import STFLIB
 from airtest.utils.logger import get_logger
 from airtest.utils.nbsp import NonBlockingStreamReader
 from airtest.utils.safesocket import SafeSocket
-from airtest.utils.snippet import reg_cleanup, on_method_ready, ready_method, kill_proc
+from airtest.utils.snippet import on_method_ready, ready_method, kill_proc
 from airtest.utils.threadsafe import threadsafe_generator
-from airtest.core.android.cap_methods.base_cap import BaseCap
-from airtest import aircv
+from airtest.core.android.cap_methods.minicap_base import (
+    MinicapBase,
+    retry_when_socket_error,
+)
 from airtest.core.error import ScreenError
 
 LOGGING = get_logger(__name__)
 
 
-def retry_when_socket_error(func):
-    @wraps(func)
-    def wrapper(inst, *args, **kwargs):
-        try:
-            return func(inst, *args, **kwargs)
-        except socket.error:
-            inst.frame_gen = None
-            return func(inst, *args, **kwargs)
-
-    return wrapper
-
-
-class Minicap(BaseCap):
+class Minicap(MinicapBase):
     """super fast android screenshot method from stf minicap.
 
     reference https://github.com/openstf/minicap
@@ -56,22 +44,15 @@ class Minicap(BaseCap):
         :param adb: adb instance of android device
         :param projection: projection, default is None. If `None`, physical display size is used
         """
-        super(Minicap, self).__init__(adb=adb)
-        self.projection = projection
-        self.display_id = display_id
-        self.ori_function = ori_function or self.adb.get_display_info
-        self.frame_gen = None
+        super(Minicap, self).__init__(
+            adb=adb,
+            projection=projection,
+            rotation_watcher=rotation_watcher,
+            display_id=display_id,
+            ori_function=ori_function,
+        )
         self.stream_lock = threading.Lock()
-        self.quirk_flag = 0
         self._stream_rotation = None
-        self._update_rotation_event = threading.Event()
-        if rotation_watcher:
-            # Minicap needs to be reconnected when switching between landscape and portrait
-            # minicap需要在横竖屏转换时，重新连接
-            rotation_watcher.reg_callback(lambda x: self.update_rotation(x * 90))
-        self.cleanup_func = []
-        # Force cleanup on exit
-        reg_cleanup(self.teardown_stream)
 
     @ready_method
     def install_or_upgrade(self):
@@ -201,63 +182,13 @@ class Minicap(BaseCap):
         else:
             raise ScreenError("invalid jpg format")
 
-    def _get_params(self, projection=None):
-        """
-        Get the minicap origin parameters and count the projection
-
-        Returns:
-            physical display size (width, height), counted projection (width, height) and real display orientation
-
-        """
-        display_info = self.ori_function()
-        real_width = display_info["width"]
-        real_height = display_info["height"]
-        real_rotation = display_info["rotation"]
-        # 优先去传入的projection
-        projection = projection or self.projection
-        if projection:
-            proj_width, proj_height = projection
-        else:
-            proj_width, proj_height = real_width, real_height
-
-        if self.quirk_flag & 2 and real_rotation in (90, 270):
-            params = real_height, real_width, proj_height, proj_width, 0
-        else:
-            params = real_width, real_height, proj_width, proj_height, real_rotation
-
-        return (params, display_info)
-
-    @on_method_ready("install_or_upgrade")
-    def get_stream(self, lazy=True):
-        """
-        Get stream, it uses `adb forward`and socket communication. Use minicap ``lazy``mode (provided by gzmaruijie)
-        for long connections - returns one latest frame from the server
-
-
-        Args:
-            lazy: True or False
-
-        Returns:
-
-        """
-        gen = self._get_stream(lazy)
-
-        # if quirk error, restart server and client once
-        stopped = next(gen)
-
-        if stopped:
-            try:
-                next(gen)
-            except StopIteration:
-                pass
-            gen = self._get_stream(lazy)
-            next(gen)
-
-        return gen
-
     @threadsafe_generator
     @on_method_ready("install_or_upgrade")
-    def _get_stream(self, lazy=True):
+    def _get_stream(self, lazy=True, projection=None):
+        # `projection` is accepted for compatibility with the base class
+        # `get_stream` signature; the minicap stream projection is fixed at
+        # server setup by ``self.projection`` (per-frame projections are
+        # handled by the one-shot `get_frame`)
         self._cleanup_minicap()
         proc, nbsp, localport = self._setup_stream_server(lazy=lazy)
         s = SafeSocket()
@@ -326,18 +257,7 @@ class Minicap(BaseCap):
         deviceport = deviceport[len("localabstract:") :]
         other_opt = "-l" if lazy else ""
         params, display_info = self._get_params()
-        if self.display_id:
-            proc = self.adb.start_shell(
-                "%s -d %s -n '%s' -P %dx%d@%dx%d/%d %s 2>&1"
-                % tuple(
-                    [self.CMD, self.display_id, deviceport] + list(params) + [other_opt]
-                ),
-            )
-        else:
-            proc = self.adb.start_shell(
-                "%s -n '%s' -P %dx%d@%dx%d/%d %s 2>&1"
-                % tuple([self.CMD, deviceport] + list(params) + [other_opt]),
-            )
+        proc = self._start_stream_proc(deviceport, params, other_opt)
         nbsp = NonBlockingStreamReader(
             proc.stdout, print_output=True, name="minicap_server", auto_kill=True
         )
@@ -374,43 +294,6 @@ class Minicap(BaseCap):
         if self.frame_gen is None:
             self.frame_gen = self.get_stream()
         return six.next(self.frame_gen)
-
-    def snapshot(self, ensure_orientation=True, projection=None):
-        """
-
-        Args:
-            ensure_orientation: True or False whether to keep the orientation same as display
-            projection: the size of the desired projection, (width, height)
-
-        Returns:
-
-        """
-        if projection:
-            # minicap模式在单张截图时，可以传入projection参数来强制指定图片大小，如手机分辨率(width, height)
-            screen = self.get_frame(projection=projection)
-            try:
-                screen = aircv.utils.string_2_img(screen)
-            except Exception:
-                # may be black/locked screen or other reason, print exc for debugging
-                traceback.print_exc()
-                return None
-            return screen
-        else:
-            return super(Minicap, self).snapshot()
-
-    def update_rotation(self, rotation):
-        """
-        Update rotation and reset the backend stream generator
-
-        Args:
-            rotation: rotation input
-
-        Returns:
-            None
-
-        """
-        LOGGING.debug("update_rotation: %s" % rotation)
-        self._update_rotation_event.set()
 
     def _cleanup_minicap(self):
         """
@@ -456,24 +339,3 @@ class Minicap(BaseCap):
         for func in self.cleanup_func:
             func()
         self.cleanup_func = []
-
-    def teardown_stream(self):
-        """
-        End the stream
-
-        Returns:
-            None
-
-        """
-        # clean up established connections
-        self._cleanup()
-        if not self.frame_gen:
-            return
-        try:
-            self.frame_gen.send(1)
-        except (TypeError, StopIteration):
-            # TypeError: can't send non-None value to a just-started generator
-            pass
-        else:
-            LOGGING.warn("%s tear down failed" % self.frame_gen)
-        self.frame_gen = None
