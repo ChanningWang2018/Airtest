@@ -1,7 +1,6 @@
 # _*_ coding:UTF-8 _*_
 import socket
 import errno
-import struct
 
 
 class SafeSocket(object):
@@ -85,42 +84,3 @@ class SafeSocket(object):
             self.sock.close()
         else:
             self.sock.close()
-
-    def recv_latest_frame(self):
-        """
-        非阻塞吸干缓冲区，只返回最新一帧 JPEG
-        返回 None 表示当前无帧；连接断开会抛 ConnectionResetError
-        """
-        self.sock.setblocking(False)  # ① 切非阻塞
-        latest_jpeg = None
-
-        while True:
-            # ② 读 4 B 头
-            header = self._recv_nonblocking_exact(4)
-            if header is None:
-                break  # 内核缓冲区已空
-            frame_size = struct.unpack("<I", header)[0]
-
-            # ③ 读 JPEG 本体
-            jpeg = self._recv_nonblocking_exact(frame_size)
-            if jpeg is None:
-                # 半包：把头塞回去，下次再读
-                self.buf = header + self.buf
-                break
-            latest_jpeg = jpeg  # 只保留最新
-
-        self.sock.setblocking(True)  # ④ 恢复原模式
-        return latest_jpeg
-
-    def _recv_nonblocking_exact(self, size):
-        """非阻塞凑包，够 size 返回 bytes，否则 None"""
-        while len(self.buf) < size:
-            try:
-                chunk = self.sock.recv(min(size - len(self.buf), 4096))
-                if chunk == b"":  # 对端关闭
-                    raise ConnectionResetError("peer closed")
-                self.buf += chunk
-            except BlockingIOError:  # 10035/11 统一捕获
-                return None
-        data, self.buf = self.buf[:size], self.buf[size:]
-        return data
